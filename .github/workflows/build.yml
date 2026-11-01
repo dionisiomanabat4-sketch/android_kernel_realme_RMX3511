@@ -49,6 +49,28 @@ jobs:
             exit 1
           }
 
+      
+      - name: Diagnose MT7601U Kconfig
+        run: |
+          echo "Searching for MT7601U configuration..."
+
+          grep -Rni "config MT7601U" drivers/net/wireless || true
+
+          echo "Checking Kconfig registration..."
+
+          grep -Rni "mt7601u" \
+            drivers/net/wireless/Kconfig \
+            drivers/net/wireless/mediatek/ 2>/dev/null || true
+
+          echo "Checking driver files..."
+
+          ls -la drivers/net/wireless/mediatek/mt7601u/
+
+          echo "Checking kernel dependencies..."
+
+          grep -E 'CONFIG_(USB|CFG80211|MAC80211|MT7601U)=' .config || true
+          
+
       - name: Configure Kernel
         run: |
           export ARCH=arm64
