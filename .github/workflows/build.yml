@@ -82,27 +82,7 @@ jobs:
             -m MAC80211 \
             -m MT7601U
 
-          # Realme's zram "hybridswap" code does not build here and has
-          # nothing to do with WiFi, so turn off zram and hybridswap.
-          scripts/config --file .config -d ZRAM
-          for sym in $(grep -oE '^CONFIG_[A-Z0-9_]*HYBRIDSWAP[A-Z0-9_]*' .config | sed 's/^CONFIG_//'); do
-            echo "Disabling $sym"
-            scripts/config --file .config -d "$sym"
-          done
-
           make olddefconfig
-
-          echo "Hybridswap/zram state after olddefconfig:"
-          grep -iE 'hybridswap|CONFIG_ZRAM' .config || echo "(none left)"
-
-          # Fail in a minute instead of after a 9 minute compile
-          if grep -qE '^CONFIG_[A-Z0-9_]*HYBRIDSWAP[A-Z0-9_]*=[ym]' .config; then
-            echo "ERROR: hybridswap is still enabled, something is selecting it."
-            grep -rn "HYBRIDSWAP" --include='Kconfig*' . | head -n 60
-            echo "--- zram Makefile ---"
-            cat drivers/block/zram/Makefile
-            exit 1
-          fi
 
           echo "Checking MT7601U configuration..."
           grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK)=' .config || true
@@ -133,21 +113,29 @@ jobs:
         run: |
           set -o pipefail
 
-          # -k keeps going after an error, so one run lists every failure
-          make -k -j$(nproc) modules 2>&1 | tee build.log || {
-            echo "=========== COMPILER ERRORS ==========="
-            grep -nE "error:|fatal error" build.log | head -n 40
-
-            echo "=========== FAILED FILES ==========="
-            grep -E "\*\*\* \[.*\.(o|ko)\]" build.log | head -n 20
-            exit 1
-          }
+          # Build only the modules we need (cfg80211, mac80211, mt7601u)
+          # instead of the whole vendor kernel, whose other drivers do not
+          # compile with a modern clang. Missing kernel symbols are only
+          # warnings here (KBUILD_MODPOST_WARN) because vmlinux is not built.
+          extra=""
+          for dir in net/wireless net/mac80211 drivers/net/wireless/mediatek/mt7601u; do
+            echo "=========== Building $dir ==========="
+            make -j"$(nproc)" M="$dir" \
+              KBUILD_MODPOST_WARN=1 \
+              KBUILD_EXTRA_SYMBOLS="$extra" \
+              modules 2>&1 | tee -a build.log || {
+                echo "=========== BUILD FAILED in $dir ==========="
+                grep -nE "error:|fatal error|No rule|\*\*\*" build.log | head -n 30
+                exit 1
+              }
+            extra="$extra $PWD/$dir/Module.symvers"
+          done
 
       - name: Verify and Collect Module
         run: |
           mkdir -p output_mod
 
-          find drivers/net/wireless/mediatek/mt7601u \
+          find net/wireless net/mac80211 drivers/net/wireless/mediatek/mt7601u \
             -type f -name "*.ko" \
             -exec cp {} output_mod/ \;
 
