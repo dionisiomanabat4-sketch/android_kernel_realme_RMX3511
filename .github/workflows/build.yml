@@ -80,12 +80,22 @@ jobs:
             -e USB \
             -m CFG80211 \
             -m MAC80211 \
-            -m MT7601U
+            -m MT7601U \
+            -d MODULE_SIG \
+            -d MODULE_SIG_FORCE
 
           make olddefconfig
 
           echo "Checking MT7601U configuration..."
           grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK)=' .config || true
+
+          echo "Module signing state:"
+          grep -E 'CONFIG_MODULE_SIG(_FORCE)?[= ]' .config || echo "(MODULE_SIG options not present)"
+
+          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' .config; then
+            echo "ERROR: module signing is still enabled!"
+            exit 1
+          fi
 
           if ! grep -q '^CONFIG_MT7601U=m' .config; then
             echo "ERROR: MT7601U is not enabled as a module!"
@@ -150,6 +160,6 @@ jobs:
       - name: Upload Driver Module
         uses: actions/upload-artifact@v4
         with:
-          name: mt7601u-driver-RMX3511
+          name: mt7601u-driver-RMX3511-nosig
           path: output_mod/*.ko
           if-no-files-found: error
