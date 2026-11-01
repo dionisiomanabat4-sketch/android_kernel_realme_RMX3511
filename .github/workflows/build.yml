@@ -16,12 +16,13 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils flex bison libelf-dev clang lld llvm
 
-    - name: Download Toolchain
+        - name: Download Toolchain
       run: |
         mkdir -p $GITHUB_WORKSPACE/toolchain
         cd $GITHUB_WORKSPACE/toolchain
         wget https://googlesource.com
-        tar -xf clang-r487747c.tar.gz
+        tar -xzf clang-r487747c.tar.gz
+        a
 
     - name: Compile MT7601U Module
       run: |
