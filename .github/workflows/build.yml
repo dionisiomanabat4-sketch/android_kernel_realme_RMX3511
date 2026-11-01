@@ -82,8 +82,9 @@ jobs:
             -m MAC80211 \
             -m MT7601U
 
-          # Realme's zram "hybridswap" code fails to build with new clang
-          # and has nothing to do with WiFi, so turn it off.
+          # Realme's zram "hybridswap" code does not build here and has
+          # nothing to do with WiFi, so turn off zram and hybridswap.
+          scripts/config --file .config -d ZRAM
           for sym in $(grep -oE '^CONFIG_[A-Z0-9_]*HYBRIDSWAP[A-Z0-9_]*' .config | sed 's/^CONFIG_//'); do
             echo "Disabling $sym"
             scripts/config --file .config -d "$sym"
@@ -91,8 +92,17 @@ jobs:
 
           make olddefconfig
 
-          echo "Hybridswap state after olddefconfig:"
-          grep -i hybridswap .config || echo "(no hybridswap symbols left)"
+          echo "Hybridswap/zram state after olddefconfig:"
+          grep -iE 'hybridswap|CONFIG_ZRAM' .config || echo "(none left)"
+
+          # Fail in a minute instead of after a 9 minute compile
+          if grep -qE '^CONFIG_[A-Z0-9_]*HYBRIDSWAP[A-Z0-9_]*=[ym]' .config; then
+            echo "ERROR: hybridswap is still enabled, something is selecting it."
+            grep -rn "HYBRIDSWAP" --include='Kconfig*' . | head -n 60
+            echo "--- zram Makefile ---"
+            cat drivers/block/zram/Makefile
+            exit 1
+          fi
 
           echo "Checking MT7601U configuration..."
           grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK)=' .config || true
