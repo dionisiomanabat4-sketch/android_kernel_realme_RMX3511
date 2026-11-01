@@ -1,3 +1,4 @@
+
 name: Build MT7601U Module
 
 on:
@@ -8,29 +9,114 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Kernel Source
-      uses: actions/checkout@v4
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
 
-    - name: Set up Build Environment
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils flex bison libelf-dev clang lld llvm gcc-aarch64-linux-gnu
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            build-essential \
+            libncurses-dev \
+            libssl-dev \
+            flex \
+            bison \
+            libelf-dev \
+            clang \
+            lld \
+            llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            pahole
 
-    - name: Compile MT7601U Module
-      run: |
-        echo "CONFIG_MT7601U=m" > drivers_config
-        ARCH=arm64 SUBARCH=arm64 scripts/kconfig/merge_config.sh arch/arm64/configs/RMX3511_athena_defconfig drivers_config
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang modules_prepare
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
+      - name: Verify Kernel Source
+        run: |
+          echo "Checking kernel source..."
 
-    - name: Verify and Find Module
-      run: |
-        mkdir -p output_mod
-        find drivers/net/wireless/ -name "*.ko" -exec cp {} output_mod/ \;
+          test -f Makefile || {
+            echo "ERROR: Kernel source not found!"
+            exit 1
+          }
 
-    - name: Upload Driver Module
-      uses: actions/upload-artifact@v4
-      with:
-        name: mt7601u-driver
-        path: output_mod/
-        
+          test -f arch/arm64/configs/RMX3511_athena_defconfig || {
+            echo "ERROR: RMX3511 defconfig not found!"
+            exit 1
+          }
+
+          test -f drivers/net/wireless/mediatek/mt7601u/Makefile || {
+            echo "ERROR: MT7601U driver source not found!"
+            exit 1
+          }
+
+      - name: Configure Kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make RMX3511_athena_defconfig
+
+          cat > drivers_config <<'EOF'
+          CONFIG_WLAN=y
+          CONFIG_USB=y
+          CONFIG_CFG80211=m
+          CONFIG_MAC80211=m
+          CONFIG_MT7601U=m
+          EOF
+
+          bash scripts/kconfig/merge_config.sh \
+            -m .config drivers_config
+
+          make olddefconfig
+
+          echo "Checking MT7601U configuration..."
+          grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211)=' .config || true
+
+          grep -q '^CONFIG_MT7601U=m' .config || {
+            echo "ERROR: MT7601U is not enabled as a module!"
+            exit 1
+          }
+
+      - name: Prepare Kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make modules_prepare
+
+      - name: Compile MT7601U
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make -j$(nproc) modules
+
+      - name: Verify and Collect Module
+        run: |
+          mkdir -p output_mod
+
+          find drivers/net/wireless/mediatek/mt7601u \
+            -type f -name "*.ko" \
+            -exec cp {} output_mod/ \;
+
+          echo "Checking generated modules..."
+          ls -lh output_mod/
+
+          if ! find output_mod -name "mt7601u.ko" | grep -q .; then
+            echo "ERROR: mt7601u.ko was not generated!"
+            exit 1
+          fi
+
+      - name: Upload Driver Module
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt7601u-driver-RMX3511
+          path: output_mod/*.ko
+          if-no-files-found: error
+          
