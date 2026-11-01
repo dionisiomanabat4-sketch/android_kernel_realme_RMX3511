@@ -18,8 +18,8 @@ jobs:
 
     - name: Compile MT7601U Module
       run: |
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang RMX3511_athena_defconfig
-        echo "CONFIG_MT7601U=m" >> .config
+        echo "CONFIG_MT7601U=m" > drivers_config
+        ARCH=arm64 SUBARCH=arm64 scripts/kconfig/merge_config.sh arch/arm64/configs/RMX3511_athena_defconfig drivers_config
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang modules_prepare
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
 
