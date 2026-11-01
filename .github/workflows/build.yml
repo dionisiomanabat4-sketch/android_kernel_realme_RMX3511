@@ -1,0 +1,38 @@
+name: Build MT7601U Module
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Kernel Source
+      uses: actions/checkout@v3
+
+    - name: Set up Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils flex bison libelf-dev clang lld llvm
+
+    - name: Download Toolchain
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/toolchain
+        cd $GITHUB_WORKSPACE/toolchain
+        wget https://googlesource.com
+        tar -xf clang-r487747c.tar.gz
+
+    - name: Compile MT7601U Module
+      run: |
+        export PATH=$GITHUB_WORKSPACE/toolchain/bin:$PATH
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang RMX3511_athena_defconfig
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang modules_prepare
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
+
+    - name: Upload Driver Module
+      uses: actions/upload-artifact@v3
+      with:
+        name: mt7601u-driver
+        path: drivers/net/wireless/mediatek/mt7601u/mt7601u.ko
+        
