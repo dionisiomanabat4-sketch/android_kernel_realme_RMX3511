@@ -1,0 +1,206 @@
+name: Build Athena Kernel (MT7601U built-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_release:
+        description: "Phone kernel version - paste the output of: uname -r"
+        required: false
+        default: ""
+      image_format:
+        description: "Kernel image format to package"
+        required: false
+        default: "Image"
+        type: choice
+        options:
+          - Image
+          - Image.gz
+
+env:
+  KERNEL_RELEASE: ${{ inputs.kernel_release }}
+  IMAGE_FORMAT: ${{ inputs.image_format }}
+  ARCH: arm64
+  SUBARCH: arm64
+  LLVM: 1
+  CROSS_COMPILE: aarch64-linux-gnu-
+  # The kernel's build.config.common asks for AOSP clang r416183b (clang 12)
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz
+  FW_URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mt7601u.bin
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git \
+            libelf-dev libncurses-dev libssl-dev lz4 python3 \
+            xz-utils zip unzip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Download Android Clang r416183b
+        run: |
+          mkdir -p "$HOME/clang"
+          curl -fL --retry 5 --retry-delay 5 "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C "$HOME/clang"
+          rm -f clang.tar.gz
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version
+
+      - name: Verify Kernel Source
+        run: |
+          test -f Makefile || { echo "ERROR: Kernel source not found!"; exit 1; }
+          test -f arch/arm64/configs/RMX3511_athena_defconfig || {
+            echo "ERROR: RMX3511_athena_defconfig not found!"
+            exit 1
+          }
+          test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
+            echo "ERROR: MT7601U driver source not found!"
+            exit 1
+          }
+
+      - name: Get MT7601U firmware
+        run: |
+          mkdir -p firmware
+          if ! curl -fL --retry 3 --retry-delay 5 -o firmware/mt7601u.bin "$FW_URL"; then
+            echo "kernel.org download failed, trying the Ubuntu package"
+            sudo apt-get install -y linux-firmware
+            cp /lib/firmware/mt7601u.bin firmware/mt7601u.bin
+          fi
+          ls -l firmware/mt7601u.bin
+          test -s firmware/mt7601u.bin
+
+      - name: Configure Kernel
+        run: |
+          make O=out RMX3511_athena_defconfig
+
+          # MT7601U built in. cfg80211 and mac80211 are already built in on
+          # the phone. Module signing off so nothing is checked at load time.
+          scripts/config --file out/.config \
+            -e WIRELESS \
+            -e WLAN \
+            -e WLAN_VENDOR_MEDIATEK \
+            -e USB \
+            -e CFG80211 \
+            -e MAC80211 \
+            -e MT7601U \
+            -d MODULE_SIG \
+            -d MODULE_SIG_FORCE
+
+          # Embed the adapter firmware so nothing has to be copied to the phone
+          scripts/config --file out/.config \
+            -e FW_LOADER \
+            --set-str EXTRA_FIRMWARE "mt7601u.bin" \
+            --set-str EXTRA_FIRMWARE_DIR "firmware"
+
+          # Make the version string match the phone's running kernel
+          if [ -n "$KERNEL_RELEASE" ]; then
+            base="$(make -s kernelversion)"
+            case "$KERNEL_RELEASE" in
+              "$base"*) ;;
+              *) echo "ERROR: kernel_release must start with $base"; exit 1 ;;
+            esac
+            suffix="${KERNEL_RELEASE#"$base"}"
+            echo "Using local version: $suffix"
+            scripts/config --file out/.config --set-str LOCALVERSION "$suffix" -d LOCALVERSION_AUTO
+          fi
+
+          make O=out olddefconfig
+
+          echo "=========== Resulting config ==========="
+          grep -E '^CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|MODULE_SIG|MODVERSIONS|LTO|CFI)' out/.config || true
+
+          if ! grep -q '^CONFIG_MT7601U=y' out/.config; then
+            echo "ERROR: MT7601U is not enabled as built-in!"
+            cat drivers/net/wireless/mediatek/mt7601u/Kconfig
+            grep -E 'CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|MAC80211|CFG80211)[= ]' out/.config || true
+            grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
+            grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
+            grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
+            exit 1
+          fi
+
+          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' out/.config; then
+            echo "ERROR: module signing is still enabled!"
+            exit 1
+          fi
+
+      - name: Build Kernel
+        run: |
+          set -o pipefail
+
+          make O=out -j"$(nproc)" "$IMAGE_FORMAT" 2>&1 | tee build.log || {
+            echo "=========== COMPILER ERRORS ==========="
+            grep -nE "error:|fatal error|undefined reference|\*\*\*" build.log | head -n 40
+            exit 1
+          }
+
+          release="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $release"
+
+          if [ -n "$KERNEL_RELEASE" ] && [ "$release" != "$KERNEL_RELEASE" ]; then
+            echo "ERROR: built release does not match $KERNEL_RELEASE"
+            exit 1
+          fi
+
+          ls -lh out/arch/arm64/boot/
+          strings -a out/arch/arm64/boot/Image > image_strings.txt
+          echo "mt7601u mentions inside the kernel: $(grep -c mt7601u image_strings.txt)"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE
+
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 - kernel-only flash for RMX3511
+          properties() { '
+          kernel.string=Athena Kernel RMX3511 (MT7601U built-in)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # replace only the kernel, leave the ramdisk untouched
+          split_boot;
+          flash_boot;
+          EOF
+
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" ak3/
+
+          mkdir -p release
+          (cd ak3 && zip -r9 ../release/Athena-RMX3511-MT7601U.zip . -x ".git*")
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" release/
+          cp out/.config release/kernel-config.txt
+          ls -lh release/
+
+      - name: Upload Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-kernel-RMX3511-mt7601u
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+          
