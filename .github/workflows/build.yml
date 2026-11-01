@@ -54,6 +54,18 @@ jobs:
             exit 1
           }
 
+      - name: Patch Makefiles for new LLD
+        run: |
+          # Old kernels pass -plugin-opt=-warn-stack-size to the linker.
+          # LLD 13+ removed that option, which breaks the vDSO link.
+          echo "Before:"
+          grep -rn "warn-stack-size" Makefile arch/arm64/Makefile || true
+
+          sed -i '/-plugin-opt=-warn-stack-size/d' Makefile arch/arm64/Makefile
+
+          echo "After:"
+          grep -rn "warn-stack-size" Makefile arch/arm64/Makefile || echo "removed"
+
       - name: Configure Kernel
         run: |
           make RMX3511_athena_defconfig
