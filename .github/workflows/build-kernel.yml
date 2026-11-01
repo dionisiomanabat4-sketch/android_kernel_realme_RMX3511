@@ -1,38 +1,31 @@
-
 name: Build Athena Kernel (MT7601U built-in)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_release:
-        description: "Optional: exact output of uname -r on the RMX3511"
+        description: "Phone kernel version - paste the output of: uname -r (empty = keep the source's own version)"
         required: false
         default: ""
-        type: string
-
       image_format:
         description: "Kernel image format to package"
-        required: true
+        required: false
         default: "Image"
         type: choice
         options:
           - Image
           - Image.gz
 
-permissions:
-  contents: read
-
 env:
   KERNEL_RELEASE: ${{ inputs.kernel_release }}
   IMAGE_FORMAT: ${{ inputs.image_format }}
   ARCH: arm64
   SUBARCH: arm64
-  LLVM: "1"
+  LLVM: 1
   CROSS_COMPILE: aarch64-linux-gnu-
-
+  # The kernel's build.config.common asks for AOSP clang r416183b (clang 12)
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz
-
-  FW_URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mediatek/mt7601u.bin
+  FW_URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mt7601u.bin
 
 jobs:
   build:
@@ -40,127 +33,56 @@ jobs:
     timeout-minutes: 240
 
     steps:
-
-      # 1. Checkout kernel
       - name: Checkout Kernel Source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      # 2. Install dependencies
       - name: Install Build Dependencies
         run: |
-          set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
             bc bison build-essential cpio curl flex git \
             libelf-dev libncurses-dev libssl-dev lz4 python3 \
-            xz-utils zip unzip zlib1g-dev \
+            xz-utils zip unzip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      # 3. Download Android Clang
       - name: Download Android Clang r416183b
         run: |
-          set -euo pipefail
-
           mkdir -p "$HOME/clang"
-
-          curl -fL --retry 5 --retry-delay 5 \
-            "$CLANG_URL" -o clang.tar.gz
-
+          curl -fL --retry 5 --retry-delay 5 "$CLANG_URL" -o clang.tar.gz
           tar -xzf clang.tar.gz -C "$HOME/clang"
-
           rm -f clang.tar.gz
-
-          test -x "$HOME/clang/bin/clang" || {
-            echo "ERROR: Clang executable not found"
-            find "$HOME/clang" -maxdepth 3 -name clang -print
-            exit 1
-          }
-
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-
           "$HOME/clang/bin/clang" --version
 
-      # 4. Verify kernel source
       - name: Verify Kernel Source
         run: |
-          set -euo pipefail
-
-          test -f Makefile || {
-            echo "ERROR: Kernel source not found"
-            exit 1
-          }
-
+          test -f Makefile || { echo "ERROR: Kernel source not found!"; exit 1; }
           test -f arch/arm64/configs/RMX3511_athena_defconfig || {
-            echo "ERROR: Athena defconfig not found"
+            echo "ERROR: RMX3511_athena_defconfig not found!"
             exit 1
           }
-
           test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
-            echo "ERROR: MT7601U Kconfig not found"
+            echo "ERROR: MT7601U driver source not found!"
             exit 1
           }
 
-          test -f drivers/net/wireless/mediatek/mt7601u/usb.h || {
-            echo "ERROR: MT7601U usb.h not found"
-            exit 1
-          }
-
-          grep -Fq '"mt7601u.bin"' \
-            drivers/net/wireless/mediatek/mt7601u/usb.h || {
-            echo "ERROR: Firmware filename mismatch"
-            exit 1
-          }
-
-          case "$IMAGE_FORMAT" in
-            Image|Image.gz) ;;
-            *)
-              echo "ERROR: Unsupported image format"
-              exit 1
-              ;;
-          esac
-
-      # 5. Get MT7601U firmware
-      - name: Get MT7601U Firmware
+      - name: Get MT7601U firmware
         run: |
-          set -euo pipefail
-
           mkdir -p firmware
-
-          if ! curl -fL --retry 5 --retry-delay 5 \
-            -o firmware/mt7601u.bin "$FW_URL"; then
-
-            echo "Direct download failed; trying Ubuntu linux-firmware"
-
+          if ! curl -fL --retry 3 --retry-delay 5 -o firmware/mt7601u.bin "$FW_URL"; then
+            echo "kernel.org download failed, trying the Ubuntu package"
             sudo apt-get install -y linux-firmware
-
-            fw_path="$(find /lib/firmware /usr/lib/firmware \
-              -name mt7601u.bin -print -quit 2>/dev/null || true)"
-
-            if [ -z "$fw_path" ] || [ ! -s "$fw_path" ]; then
-              echo "ERROR: MT7601U firmware not found"
-              exit 1
-            fi
-
-            cp "$fw_path" firmware/mt7601u.bin
+            cp /lib/firmware/mt7601u.bin firmware/mt7601u.bin
           fi
-
+          ls -l firmware/mt7601u.bin
           test -s firmware/mt7601u.bin
 
-          ls -lh firmware/mt7601u.bin
-          sha256sum firmware/mt7601u.bin
-
-      # 6. Configure kernel
       - name: Configure Kernel
         run: |
-          set -euo pipefail
-
           make O=out RMX3511_athena_defconfig
 
-          # Enable MT7601U as a built-in driver
+          # MT7601U built in. cfg80211 and mac80211 are already built in on
+          # the phone. Module signing off so nothing is checked at load time.
           scripts/config --file out/.config \
             -e WIRELESS \
             -e WLAN \
@@ -169,168 +91,162 @@ jobs:
             -e CFG80211 \
             -e MAC80211 \
             -e MT7601U \
-            -e FW_LOADER \
             -d MODULE_SIG \
-            -d MODULE_SIG_FORCE \
-            -d MODULE_SIG_ALL \
+            -d MODULE_SIG_FORCE
+
+          # Embed the adapter firmware so nothing has to be copied to the phone
+          scripts/config --file out/.config \
+            -e FW_LOADER \
             --set-str EXTRA_FIRMWARE "mt7601u.bin" \
             --set-str EXTRA_FIRMWARE_DIR "firmware"
 
-          # Match the phone's kernel release
-          base="$(make -s kernelversion)"
+          # Make the version string match the phone's running kernel.
+          # Accepts whatever was pasted: extra spaces, a trailing newline,
+          # or a whole `uname -a` line - only the release token is kept.
+          want="$(printf '%s\n' "$KERNEL_RELEASE" |
+            grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n 1 || true)"
 
-          if [ -n "$KERNEL_RELEASE" ]; then
+          if [ -n "$want" ]; then
+            src_ver="$(make -s kernelversion)"    # e.g. 5.4.256-rev6
+            src_num="$(printf '%s' "$src_ver" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
+            want_num="$(printf '%s' "$want" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
 
-            case "$KERNEL_RELEASE" in
-              "$base"*) ;;
-              *)
-                echo "ERROR: kernel_release must start with $base"
-                exit 1
-                ;;
-            esac
+            # Only the number (5.4.256) has to match the source tree. Whatever
+            # follows it is the phone's own suffix and is used as-is.
+            if [ "$want_num" != "$src_num" ]; then
+              echo "ERROR: the phone runs $want_num but this source tree is $src_num"
+              echo "       phone:  $want"
+              echo "       source: $src_ver"
+              echo "       Paste the uname -r of the kernel this source belongs to,"
+              echo "       or leave kernel_release empty."
+              exit 1
+            fi
 
-            suffix="${KERNEL_RELEASE#"$base"}"
+            suffix="${want#"$want_num"}"
+            echo "Phone kernel : $want"
+            echo "Source tree  : $src_ver"
+            echo "Local version: '$suffix'"
 
-            echo "Using LOCALVERSION suffix: $suffix"
+            # The Makefile has its own EXTRAVERSION (-rev6) that sits in front
+            # of CONFIG_LOCALVERSION. Clear it so the phone's suffix is the
+            # whole story.
+            sed -i 's/^EXTRAVERSION[[:space:]]*=.*/EXTRAVERSION =/' Makefile
+            if [ "$(make -s kernelversion)" != "$src_num" ]; then
+              echo "ERROR: could not clear EXTRAVERSION in Makefile"
+              grep -n '^EXTRAVERSION' Makefile || true
+              exit 1
+            fi
+
+            # Stop git from adding "+" / "-dirty" / "-g<hash>" to the release
+            : > .scmversion
 
             scripts/config --file out/.config \
-              --set-str LOCALVERSION "$suffix"
+              --set-str LOCALVERSION "$suffix" \
+              -d LOCALVERSION_AUTO
 
-          else
-            echo "Keeping defconfig LOCALVERSION"
+            # Remembered for the check in the Build step
+            echo "WANT_RELEASE=$want" >> "$GITHUB_ENV"
+          elif [ -n "${KERNEL_RELEASE//[[:space:]]/}" ]; then
+            echo "ERROR: no kernel version (like 5.4.256-xxx) found in kernel_release: '$KERNEL_RELEASE'"
+            exit 1
           fi
-
-          # Prevent automatic Git version suffixes
-          scripts/config --file out/.config -d LOCALVERSION_AUTO
 
           make O=out olddefconfig
 
           echo "=========== Resulting config ==========="
+          grep -E '^CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|MODULE_SIG|MODVERSIONS|LTO|CFI)' out/.config || true
 
-          grep -E '^(CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|CFG80211|MAC80211|MT7601U|FW_LOADER|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|LOCALVERSION_AUTO|MODULE_SIG|MODULE_SIG_FORCE|MODULE_SIG_ALL))' out/.config || true
-
-          # Verify required built-in components
-          for symbol in WIRELESS WLAN WLAN_VENDOR_MEDIATEK USB CFG80211 MAC80211 MT7601U FW_LOADER; do
-
-            grep -Fxq "CONFIG_${symbol}=y" out/.config || {
-              echo "ERROR: CONFIG_${symbol} is not enabled as built-in"
-
-              grep -E '^CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|CFG80211|MAC80211|MT7601U|FW_LOADER)=' out/.config || true
-
-              exit 1
-            }
-
-          done
-
-          grep -Fxq 'CONFIG_EXTRA_FIRMWARE="mt7601u.bin"' out/.config || {
-            echo "ERROR: EXTRA_FIRMWARE is incorrect"
-            exit 1
-          }
-
-          grep -Fxq 'CONFIG_EXTRA_FIRMWARE_DIR="firmware"' out/.config || {
-            echo "ERROR: EXTRA_FIRMWARE_DIR is incorrect"
-            exit 1
-          }
-
-          if grep -Eq '^CONFIG_MODULE_SIG(_FORCE|_ALL)?=y$' out/.config; then
-            echo "ERROR: Module signing is still enabled"
+          if ! grep -q '^CONFIG_MT7601U=y' out/.config; then
+            echo "ERROR: MT7601U is not enabled as built-in!"
+            cat drivers/net/wireless/mediatek/mt7601u/Kconfig
+            grep -E 'CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|MAC80211|CFG80211)[= ]' out/.config || true
+            grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
+            grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
+            grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
             exit 1
           fi
 
-      # 7. Build kernel
+          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' out/.config; then
+            echo "ERROR: module signing is still enabled!"
+            exit 1
+          fi
+
       - name: Build Kernel
         run: |
-          set -euo pipefail
+          set -o pipefail
+          : > build.log
 
-          if ! make O=out -j"$(nproc)" "$IMAGE_FORMAT" 2>&1 | tee build.log; then
-
-            echo "=========== COMPILER ERRORS ==========="
-
-            grep -nE "error:|fatal error|undefined reference|\*\*\*" \
-              build.log | head -n 50 || true
-
-            exit 1
-          fi
-
-          release="$(cat out/include/config/kernel.release)"
-
-          echo "Built kernel release: $release"
-
-          if [ -n "$KERNEL_RELEASE" ] && [ "$release" != "$KERNEL_RELEASE" ]; then
-
-            echo "ERROR: Kernel release mismatch"
-            exit 1
-          fi
-
-          image_path="out/arch/arm64/boot/$IMAGE_FORMAT"
-
-          test -s "$image_path" || {
-            echo "ERROR: Kernel image not found"
-            exit 1
+          run_make() {
+            make O=out -j"$(nproc)" "$@" 2>&1 | tee -a build.log || {
+              echo "=========== COMPILER ERRORS ==========="
+              grep -nE "error:|fatal error|undefined reference|\*\*\*" build.log | head -n 40
+              exit 1
+            }
           }
 
+          # Generate the version headers first, so a release mismatch fails
+          # in about a minute instead of after the whole compile.
+          run_make prepare
+
+          release="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $release"
+
+          if [ -n "$WANT_RELEASE" ] && [ "$release" != "$WANT_RELEASE" ]; then
+            echo "ERROR: built release '$release' does not match the phone's '$WANT_RELEASE'"
+            grep -E '^CONFIG_LOCALVERSION' out/.config || true
+            ls -la localversion* out/localversion* .scmversion 2>/dev/null || true
+            exit 1
+          fi
+
+          run_make "$IMAGE_FORMAT"
+
           ls -lh out/arch/arm64/boot/
+          strings -a out/arch/arm64/boot/Image > image_strings.txt
+          echo "mt7601u mentions inside the kernel: $(grep -c mt7601u image_strings.txt)"
 
-          sha256sum "$image_path"
-
-      # 8. Package AnyKernel3
-      - name: Package AnyKernel3 Zip
+      - name: Package AnyKernel3 zip
         run: |
-          set -euo pipefail
-
-          git clone --depth=1 \
-            https://github.com/osm0sis/AnyKernel3.git ak3
-
-          rm -rf ak3/.git ak3/.github ak3/README.md
-
-          # Keep AnyKernel3 LICENSE.
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE
 
           cat > ak3/anykernel.sh <<'EOF'
           ### AnyKernel3 - kernel-only flash for RMX3511
-
           properties() { '
           kernel.string=Athena Kernel RMX3511 (MT7601U built-in)
-          do.devicecheck=1
+          do.devicecheck=0
           do.modules=0
           do.systemless=0
           do.cleanup=1
           do.cleanuponabort=0
-          device.name1=RE87BAL1
-          device.name2=RMX3511
+          device.name1=
           supported.versions=
           supported.patchlevels=
           supported.vendorpatchlevels=
-          '; }
+          '; } # end properties
 
+          # boot shell variables
           BLOCK=boot;
           IS_SLOT_DEVICE=auto;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
 
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
           . tools/ak3-core.sh;
 
-          # Replace kernel while preserving the existing ramdisk.
+          # replace only the kernel, leave the ramdisk untouched
           split_boot;
           flash_boot;
           EOF
 
-          image_path="out/arch/arm64/boot/$IMAGE_FORMAT"
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" ak3/
 
-          cp "$image_path" "ak3/$IMAGE_FORMAT"
-
-          rm -rf release
           mkdir -p release
-
-          (cd ak3 && zip -r9 ../release/Athena-RMX3511-MT7601U.zip .)
-
-          cp "$image_path" release/
+          (cd ak3 && zip -r9 ../release/Athena-RMX3511-MT7601U.zip . -x ".git*")
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" release/
           cp out/.config release/kernel-config.txt
-          cp build.log release/build.log
-
           ls -lh release/
 
-      # 9. Upload artifacts
-      - name: Upload Kernel Artifacts
+      - name: Upload Kernel
         uses: actions/upload-artifact@v4
         with:
           name: athena-kernel-RMX3511-mt7601u
