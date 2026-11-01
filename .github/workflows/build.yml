@@ -14,22 +14,13 @@ jobs:
     - name: Set up Build Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils flex bison libelf-dev clang lld llvm
-
-    - name: Download Toolchain
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/toolchain
-        cd $GITHUB_WORKSPACE/toolchain
-        wget https://googlesource.com
-        tar -xzf clang-r487747c.tar.gz
-        a
+        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils flex bison libelf-dev clang lld llvm gcc-aarch64-linux-gnu
 
     - name: Compile MT7601U Module
       run: |
-        export PATH=$GITHUB_WORKSPACE/toolchain/bin:$PATH
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang RMX3511_athena_defconfig
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang modules_prepare
-        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang RMX3511_athena_defconfig
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang modules_prepare
+        make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
 
     - name: Upload Driver Module
       uses: actions/upload-artifact@v4
