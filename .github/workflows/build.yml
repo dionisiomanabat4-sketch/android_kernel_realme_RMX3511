@@ -110,7 +110,17 @@ jobs:
         run: make modules_prepare
 
       - name: Compile MT7601U
-        run: make -j$(nproc) modules
+        run: |
+          set -o pipefail
+
+          make -j$(nproc) modules 2>&1 | tee build.log || {
+            echo "=========== BUILD FAILED: error lines from log ==========="
+            grep -nE "error:|Error [0-9]+|\*\*\*|undefined" build.log | head -n 30
+
+            echo "=========== Retrying single-threaded to isolate the error ==========="
+            make -j1 modules 2>&1 | tail -n 40
+            exit 1
+          }
 
       - name: Verify and Collect Module
         run: |
@@ -134,4 +144,3 @@ jobs:
           name: mt7601u-driver-RMX3511
           path: output_mod/*.ko
           if-no-files-found: error
-          
