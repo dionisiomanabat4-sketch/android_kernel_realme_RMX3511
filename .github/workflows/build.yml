@@ -19,13 +19,14 @@ jobs:
     - name: Compile MT7601U Module
       run: |
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang RMX3511_athena_defconfig
+        echo "CONFIG_MT7601U=m" >> .config
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang modules_prepare
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
 
     - name: Verify and Find Module
       run: |
         mkdir -p output_mod
-        find drivers/net/wireless/mediatek/mt7601u/ -name "*.ko" -exec cp {} output_mod/ \;
+        find drivers/net/wireless/ -name "*.ko" -exec cp {} output_mod/ \;
 
     - name: Upload Driver Module
       uses: actions/upload-artifact@v4
