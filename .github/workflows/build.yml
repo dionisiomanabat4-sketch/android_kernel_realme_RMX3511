@@ -1,8 +1,13 @@
-
 name: Build MT7601U Module
 
 on:
   workflow_dispatch:
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  LLVM: 1
+  CROSS_COMPILE: aarch64-linux-gnu-
 
 jobs:
   build:
@@ -32,12 +37,7 @@ jobs:
 
       - name: Verify Kernel Source
         run: |
-          echo "Checking kernel source..."
-
-          test -f Makefile || {
-            echo "ERROR: Kernel source not found!"
-            exit 1
-          }
+          test -f Makefile || { echo "ERROR: Kernel source not found!"; exit 1; }
 
           test -f arch/arm64/configs/RMX3511_athena_defconfig || {
             echo "ERROR: RMX3511 defconfig not found!"
@@ -49,75 +49,56 @@ jobs:
             exit 1
           }
 
-      
-      - name: Diagnose MT7601U Kconfig
-        run: |
-          echo "Searching for MT7601U configuration..."
-
-          grep -Rni "config MT7601U" drivers/net/wireless || true
-
-          echo "Checking Kconfig registration..."
-
-          grep -Rni "mt7601u" \
-            drivers/net/wireless/Kconfig \
-            drivers/net/wireless/mediatek/ 2>/dev/null || true
-
-          echo "Checking driver files..."
-
-          ls -la drivers/net/wireless/mediatek/mt7601u/
-
-          echo "Checking kernel dependencies..."
-
-          grep -E 'CONFIG_(USB|CFG80211|MAC80211|MT7601U)=' .config || true
-          
+          test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
+            echo "ERROR: MT7601U Kconfig not found!"
+            exit 1
+          }
 
       - name: Configure Kernel
         run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
           make RMX3511_athena_defconfig
 
-          cat > drivers_config <<'EOF'
-          CONFIG_WLAN=y
-          CONFIG_USB=y
-          CONFIG_CFG80211=m
-          CONFIG_MAC80211=m
-          CONFIG_MT7601U=m
-          EOF
-
-          bash scripts/kconfig/merge_config.sh \
-            -m .config drivers_config
+          # MT7601U sits inside "if WLAN_VENDOR_MEDIATEK" and depends on
+          # WIRELESS + WLAN + USB + MAC80211. If any of these is off,
+          # olddefconfig silently drops CONFIG_MT7601U.
+          scripts/config --file .config \
+            -e WIRELESS \
+            -e WLAN \
+            -e WLAN_VENDOR_MEDIATEK \
+            -e USB \
+            -m CFG80211 \
+            -m MAC80211 \
+            -m MT7601U
 
           make olddefconfig
 
           echo "Checking MT7601U configuration..."
-          grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211)=' .config || true
+          grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK)=' .config || true
 
-          grep -q '^CONFIG_MT7601U=m' .config || {
+          if ! grep -q '^CONFIG_MT7601U=m' .config; then
             echo "ERROR: MT7601U is not enabled as a module!"
+
+            echo "--- MT7601U Kconfig ---"
+            cat drivers/net/wireless/mediatek/mt7601u/Kconfig
+
+            echo "--- Dependency state in .config ---"
+            grep -E 'CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|MAC80211|CFG80211)[= ]' .config || true
+
+            echo "--- Is the driver sourced by Kconfig? ---"
+            grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
+            grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
+
+            echo "--- Is the driver in the Makefile? ---"
+            grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
+
             exit 1
-          }
+          fi
 
       - name: Prepare Kernel
-        run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make modules_prepare
+        run: make modules_prepare
 
       - name: Compile MT7601U
-        run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make -j$(nproc) modules
+        run: make -j$(nproc) modules
 
       - name: Verify and Collect Module
         run: |
