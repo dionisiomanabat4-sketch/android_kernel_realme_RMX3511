@@ -9,7 +9,7 @@ jobs:
 
     steps:
     - name: Checkout Kernel Source
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Build Environment
       run: |
@@ -31,7 +31,7 @@ jobs:
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
 
     - name: Upload Driver Module
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: mt7601u-driver
         path: drivers/net/wireless/mediatek/mt7601u/mt7601u.ko
