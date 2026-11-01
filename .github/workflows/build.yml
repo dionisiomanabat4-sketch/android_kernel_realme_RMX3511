@@ -22,9 +22,14 @@ jobs:
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang modules_prepare
         make ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang M=drivers/net/wireless/mediatek/mt7601u modules
 
+    - name: Verify and Find Module
+      run: |
+        mkdir -p output_mod
+        find drivers/net/wireless/mediatek/mt7601u/ -name "*.ko" -exec cp {} output_mod/ \;
+
     - name: Upload Driver Module
       uses: actions/upload-artifact@v4
       with:
         name: mt7601u-driver
-        path: drivers/net/wireless/mediatek/mt7601u/mt7601u.ko
+        path: output_mod/
         
