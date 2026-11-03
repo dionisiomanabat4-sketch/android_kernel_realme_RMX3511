@@ -1,4 +1,4 @@
-name: Build MT7601U Module
+name: Build RMX3511 Kernel with MT7601U (TWRP flashable)
 
 on:
   workflow_dispatch:
@@ -8,10 +8,14 @@ env:
   SUBARCH: arm64
   LLVM: 1
   CROSS_COMPILE: aarch64-linux-gnu-
+  DEFCONFIG: RMX3511_athena_defconfig
+  # Confirm on the phone with: getprop ro.product.device
+  DEVICE_CODENAME: athena
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
 
     steps:
       - name: Checkout Kernel Source
@@ -33,133 +37,116 @@ jobs:
             llvm \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            pahole
+            pahole \
+            zip
 
       - name: Verify Kernel Source
         run: |
           test -f Makefile || { echo "ERROR: Kernel source not found!"; exit 1; }
-
-          test -f arch/arm64/configs/RMX3511_athena_defconfig || {
-            echo "ERROR: RMX3511 defconfig not found!"
-            exit 1
-          }
-
-          test -f drivers/net/wireless/mediatek/mt7601u/Makefile || {
-            echo "ERROR: MT7601U driver source not found!"
-            exit 1
-          }
-
-          test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
-            echo "ERROR: MT7601U Kconfig not found!"
-            exit 1
-          }
+          test -f "arch/arm64/configs/$DEFCONFIG" || { echo "ERROR: $DEFCONFIG not found!"; exit 1; }
+          test -f drivers/net/wireless/mediatek/mt7601u/Makefile || { echo "ERROR: MT7601U driver source not found!"; exit 1; }
+          test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || { echo "ERROR: MT7601U Kconfig not found!"; exit 1; }
 
       - name: Patch Makefiles for new LLD
         run: |
           # Old kernels pass -plugin-opt=-warn-stack-size to the linker.
-          # LLD 13+ removed that option, which breaks the vDSO link.
-          echo "Before:"
-          grep -rn "warn-stack-size" Makefile arch/arm64/Makefile || true
+          # LLD 13+ rejects it. Remove only that flag, not whole lines,
+          # so other flags on the same line are kept.
+          files=$(grep -rl --include='Makefile*' --include='*.mk' 'warn-stack-size' . || true)
+          if [ -n "$files" ]; then
+            echo "$files" | xargs sed -i \
+              -e 's/-Wl,-plugin-opt=-warn-stack-size//g' \
+              -e 's/-plugin-opt=-warn-stack-size//g'
+          fi
+          echo "Remaining references (should be none):"
+          grep -rn 'warn-stack-size' --include='Makefile*' --include='*.mk' . || echo "none"
 
-          sed -i '/-plugin-opt=-warn-stack-size/d' Makefile arch/arm64/Makefile
-
-          echo "After:"
-          grep -rn "warn-stack-size" Makefile arch/arm64/Makefile || echo "removed"
-
-      - name: Configure Kernel
+      - name: Configure Kernel (MT7601U built in)
         run: |
-          make RMX3511_athena_defconfig
+          make "$DEFCONFIG"
 
-          # MT7601U sits inside "if WLAN_VENDOR_MEDIATEK" and depends on
-          # WIRELESS + WLAN + USB + MAC80211. If any of these is off,
-          # olddefconfig silently drops CONFIG_MT7601U.
-          scripts/config --file .config \
-            -e WIRELESS \
-            -e WLAN \
-            -e WLAN_VENDOR_MEDIATEK \
-            -e USB \
-            -m CFG80211 \
-            -m MAC80211 \
-            -m MT7601U \
-            -d MODULE_SIG \
-            -d MODULE_SIG_FORCE
+          # The defconfig sets CONFIG_MT7601U twice (=m, then =y), so the
+          # file contradicts itself. Remove every existing line for these
+          # symbols so only one value is left.
+          for sym in WIRELESS WLAN WLAN_VENDOR_MEDIATEK USB CFG80211 MAC80211 MT7601U MODULE_SIG MODULE_SIG_FORCE; do
+            sed -i -e "/^CONFIG_${sym}=/d" -e "/^# CONFIG_${sym} is not set/d" .config
+          done
+
+          # Built in (=y) avoids module version magic, MODVERSIONS and
+          # signing mismatches entirely. MT7601U depends on MAC80211, which
+          # depends on CFG80211. If MAC80211 is a module, MT7601U cannot be
+          # built in, so all three are set to =y here.
+          printf '%s\n' \
+            CONFIG_WIRELESS=y \
+            CONFIG_WLAN=y \
+            CONFIG_WLAN_VENDOR_MEDIATEK=y \
+            CONFIG_USB=y \
+            CONFIG_CFG80211=y \
+            CONFIG_MAC80211=y \
+            CONFIG_MT7601U=y \
+            '# CONFIG_MODULE_SIG is not set' >> .config
 
           make olddefconfig
 
-          echo "Checking MT7601U configuration..."
-          grep -E 'CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK)=' .config || true
+          echo "Final driver configuration:"
+          grep -E '^CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|CFG80211|MAC80211|MT7601U)=' .config || true
 
-          echo "Module signing state:"
-          grep -E 'CONFIG_MODULE_SIG(_FORCE)?[= ]' .config || echo "(MODULE_SIG options not present)"
-
-          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' .config; then
-            echo "ERROR: module signing is still enabled!"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_MT7601U=m' .config; then
-            echo "ERROR: MT7601U is not enabled as a module!"
-
+          if [ "$(grep -c '^CONFIG_MT7601U=' .config)" -ne 1 ] || ! grep -qx 'CONFIG_MT7601U=y' .config; then
+            echo "ERROR: CONFIG_MT7601U=y is not set after olddefconfig"
             echo "--- MT7601U Kconfig ---"
             cat drivers/net/wireless/mediatek/mt7601u/Kconfig
-
-            echo "--- Dependency state in .config ---"
-            grep -E 'CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|MAC80211|CFG80211)[= ]' .config || true
-
-            echo "--- Is the driver sourced by Kconfig? ---"
-            grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
-            grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
-
-            echo "--- Is the driver in the Makefile? ---"
-            grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
-
+            echo "--- Dependency state ---"
+            grep -E '^(# )?CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|CFG80211|MAC80211)[ =]' .config || true
             exit 1
           fi
 
-      - name: Prepare Kernel
-        run: make modules_prepare
+          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' .config; then
+            echo "ERROR: module signing is enabled"
+            exit 1
+          fi
 
-      - name: Compile MT7601U
+      - name: Build Kernel Image
         run: |
           set -o pipefail
-
-          # Build only the modules we need (cfg80211, mac80211, mt7601u)
-          # instead of the whole vendor kernel, whose other drivers do not
-          # compile with a modern clang. Missing kernel symbols are only
-          # warnings here (KBUILD_MODPOST_WARN) because vmlinux is not built.
-          extra=""
-          for dir in net/wireless net/mac80211 drivers/net/wireless/mediatek/mt7601u; do
-            echo "=========== Building $dir ==========="
-            make -j"$(nproc)" M="$dir" \
-              KBUILD_MODPOST_WARN=1 \
-              KBUILD_EXTRA_SYMBOLS="$extra" \
-              modules 2>&1 | tee -a build.log || {
-                echo "=========== BUILD FAILED in $dir ==========="
-                grep -nE "error:|fatal error|No rule|\*\*\*" build.log | head -n 30
-                exit 1
-              }
-            extra="$extra $PWD/$dir/Module.symvers"
-          done
-
-      - name: Verify and Collect Module
-        run: |
-          mkdir -p output_mod
-
-          find net/wireless net/mac80211 drivers/net/wireless/mediatek/mt7601u \
-            -type f -name "*.ko" \
-            -exec cp {} output_mod/ \;
-
-          echo "Checking generated modules..."
-          ls -lh output_mod/
-
-          if ! find output_mod -name "mt7601u.ko" | grep -q .; then
-            echo "ERROR: mt7601u.ko was not generated!"
+          # KCFLAGS=-Wno-error stops newer clang warnings from failing an
+          # otherwise valid build. Real compile errors still fail the step.
+          make -j"$(nproc)" KCFLAGS=-Wno-error Image.gz-dtb 2>&1 | tee build.log || {
+            echo "=========== BUILD FAILED ==========="
+            grep -nE "error:|fatal error|No rule|\*\*\*" build.log | head -n 50
             exit 1
-          fi
+          }
+          test -f arch/arm64/boot/Image.gz-dtb || { echo "ERROR: Image.gz-dtb was not produced"; exit 1; }
+          ls -lh arch/arm64/boot/Image.gz-dtb
 
-      - name: Upload Driver Module
+      - name: Package AnyKernel3 Zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          rm -rf anykernel/.git anykernel/README.md
+          cp arch/arm64/boot/Image.gz-dtb anykernel/
+
+          # Only the codename is changed. devicecheck stays on, so the zip
+          # refuses to flash on any other device.
+          sed -i "s/^device.name1=.*/device.name1=${DEVICE_CODENAME}/" anykernel/anykernel.sh
+          grep -E '^(do\.devicecheck|device\.name1)=' anykernel/anykernel.sh
+
+          mkdir -p out
+          ZIP="out/MT7601U-${DEVICE_CODENAME}-$(date +%Y%m%d).zip"
+          (cd anykernel && zip -r9 "../$ZIP" . -x '*.git*')
+          unzip -l "$ZIP"
+
+      - name: Upload Flashable Zip
         uses: actions/upload-artifact@v4
         with:
-          name: mt7601u-driver-RMX3511-nosig
-          path: output_mod/*.ko
+          name: MT7601U-kernel-${{ env.DEVICE_CODENAME }}
+          path: out/*.zip
           if-no-files-found: error
+
+      - name: Upload Build Log and Config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-and-config
+          path: |
+            build.log
+            .config
+          if-no-files-found: warn
