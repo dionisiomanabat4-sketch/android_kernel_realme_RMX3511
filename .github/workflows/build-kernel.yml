@@ -4,17 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       kernel_release:
-        description: "Phone kernel version - paste the output of: uname -r (empty = keep the source's own version)"
+        description: "Phone kernel version - paste the output of: uname -r. Strongly recommended if the phone loads any kernel modules from its own partitions. Empty = keep the source's own version."
         required: false
         default: ""
       image_format:
-        description: "Kernel image format to package"
+        description: "Kernel image format to package. Use Image.gz-dtb if the stock kernel has its dtb appended."
         required: false
         default: "Image"
         type: choice
         options:
           - Image
           - Image.gz
+          - Image.gz-dtb
 
 env:
   KERNEL_RELEASE: ${{ inputs.kernel_release }}
@@ -23,6 +24,8 @@ env:
   SUBARCH: arm64
   LLVM: 1
   CROSS_COMPILE: aarch64-linux-gnu-
+  # Confirm on the phone with: getprop ro.product.device
+  DEVICE_CODENAME: athena
   # The kernel's build.config.common asks for AOSP clang r416183b (clang 12)
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz
   FW_URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mt7601u.bin
@@ -51,8 +54,17 @@ jobs:
           curl -fL --retry 5 --retry-delay 5 "$CLANG_URL" -o clang.tar.gz
           tar -xzf clang.tar.gz -C "$HOME/clang"
           rm -f clang.tar.gz
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          "$HOME/clang/bin/clang" --version
+
+          # The archive may or may not have a top-level folder, so find the
+          # clang binary instead of assuming a fixed path.
+          clang_bin_dir="$(dirname "$(find "$HOME/clang" -path '*/bin/clang' | head -n 1)")"
+          if [ ! -x "$clang_bin_dir/clang" ]; then
+            echo "ERROR: clang binary not found in the archive"
+            find "$HOME/clang" -maxdepth 2 | head -n 30
+            exit 1
+          fi
+          echo "$clang_bin_dir" >> "$GITHUB_PATH"
+          "$clang_bin_dir/clang" --version
 
       - name: Verify Kernel Source
         run: |
@@ -61,8 +73,12 @@ jobs:
             echo "ERROR: RMX3511_athena_defconfig not found!"
             exit 1
           }
+          test -f drivers/net/wireless/mediatek/mt7601u/Makefile || {
+            echo "ERROR: MT7601U driver Makefile not found!"
+            exit 1
+          }
           test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
-            echo "ERROR: MT7601U driver source not found!"
+            echo "ERROR: MT7601U driver Kconfig not found!"
             exit 1
           }
 
@@ -81,8 +97,8 @@ jobs:
         run: |
           make O=out RMX3511_athena_defconfig
 
-          # MT7601U built in. cfg80211 and mac80211 are already built in on
-          # the phone. Module signing off so nothing is checked at load time.
+          # MT7601U built in. cfg80211 and mac80211 are built in too, because
+          # a built-in driver cannot depend on a module. Module signing off.
           scripts/config --file out/.config \
             -e WIRELESS \
             -e WLAN \
@@ -94,15 +110,16 @@ jobs:
             -d MODULE_SIG \
             -d MODULE_SIG_FORCE
 
-          # Embed the adapter firmware so nothing has to be copied to the phone
+          # Embed the adapter firmware. The path must be absolute: with O=out,
+          # relative paths are resolved from the output folder, not the source.
           scripts/config --file out/.config \
             -e FW_LOADER \
             --set-str EXTRA_FIRMWARE "mt7601u.bin" \
-            --set-str EXTRA_FIRMWARE_DIR "firmware"
+            --set-str EXTRA_FIRMWARE_DIR "$PWD/firmware"
 
           # Make the version string match the phone's running kernel.
           # Accepts whatever was pasted: extra spaces, a trailing newline,
-          # or a whole `uname -a` line - only the release token is kept.
+          # or a whole `uname -a` line. Only the release token is kept.
           want="$(printf '%s\n' "$KERNEL_RELEASE" |
             grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n 1 || true)"
 
@@ -127,8 +144,8 @@ jobs:
             echo "Source tree  : $src_ver"
             echo "Local version: '$suffix'"
 
-            # The Makefile has its own EXTRAVERSION (-rev6) that sits in front
-            # of CONFIG_LOCALVERSION. Clear it so the phone's suffix is the
+            # The Makefile's own EXTRAVERSION (-rev6) sits in front of
+            # CONFIG_LOCALVERSION. Clear it so the phone's suffix is the
             # whole story.
             sed -i 's/^EXTRAVERSION[[:space:]]*=.*/EXTRAVERSION =/' Makefile
             if [ "$(make -s kernelversion)" != "$src_num" ]; then
@@ -154,7 +171,7 @@ jobs:
           make O=out olddefconfig
 
           echo "=========== Resulting config ==========="
-          grep -E '^CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|MODULE_SIG|MODVERSIONS|LTO|CFI)' out/.config || true
+          grep -E '^CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK|FW_LOADER|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|MODULE_SIG|MODVERSIONS|LTO|CFI)' out/.config || true
 
           if ! grep -q '^CONFIG_MT7601U=y' out/.config; then
             echo "ERROR: MT7601U is not enabled as built-in!"
@@ -163,6 +180,12 @@ jobs:
             grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
             grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
             grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
+            exit 1
+          fi
+
+          if ! grep -qx 'CONFIG_EXTRA_FIRMWARE="mt7601u.bin"' out/.config; then
+            echo "ERROR: mt7601u.bin is not set to be built into the kernel"
+            grep -E '^CONFIG_(FW_LOADER|EXTRA_FIRMWARE)' out/.config || true
             exit 1
           fi
 
@@ -200,11 +223,20 @@ jobs:
 
           run_make "$IMAGE_FORMAT"
 
+          # Always build the uncompressed Image too. It is the file the
+          # firmware check below reads, and it is a no-op if already built.
+          run_make Image
+
           ls -lh out/arch/arm64/boot/
           strings -a out/arch/arm64/boot/Image > image_strings.txt
-          echo "mt7601u mentions inside the kernel: $(grep -c mt7601u image_strings.txt)"
 
-      - name: Package AnyKernel3 zip
+          if ! grep -q 'mt7601u.bin' image_strings.txt; then
+            echo "ERROR: mt7601u.bin firmware is not embedded in the kernel image"
+            exit 1
+          fi
+          echo "mt7601u driver strings found: $(grep -c mt7601u image_strings.txt)"
+
+      - name: Package AnyKernel3 Zip
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE
@@ -213,7 +245,7 @@ jobs:
           ### AnyKernel3 - kernel-only flash for RMX3511
           properties() { '
           kernel.string=Athena Kernel RMX3511 (MT7601U built-in)
-          do.devicecheck=0
+          do.devicecheck=1
           do.modules=0
           do.systemless=0
           do.cleanup=1
@@ -238,10 +270,21 @@ jobs:
           flash_boot;
           EOF
 
+          # Set the device codename. devicecheck stays on, so the zip refuses
+          # to flash on any other device.
+          sed -i "s/^device.name1=.*/device.name1=${DEVICE_CODENAME}/" ak3/anykernel.sh
+          grep -E '^(do\.devicecheck|device\.name1)=' ak3/anykernel.sh
+
           cp "out/arch/arm64/boot/$IMAGE_FORMAT" ak3/
 
           mkdir -p release
-          (cd ak3 && zip -r9 ../release/Athena-RMX3511-MT7601U.zip . -x ".git*")
+          ZIP="release/Athena-RMX3511-MT7601U-${DEVICE_CODENAME}.zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x ".git*")
+
+          # Confirm the zip is intact and contains the kernel and installer
+          unzip -tq "$ZIP"
+          unzip -l "$ZIP"
+
           cp "out/arch/arm64/boot/$IMAGE_FORMAT" release/
           cp out/.config release/kernel-config.txt
           ls -lh release/
