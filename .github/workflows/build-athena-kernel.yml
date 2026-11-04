@@ -1,0 +1,433 @@
+name: Build Athena Kernel (MT7601U built-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_format:
+        description: "Kernel image format. Your stock kernel is a plain Image (checked automatically), so leave this as Image."
+        required: false
+        default: "Image"
+        type: choice
+        options:
+          - Image
+          - Image.gz
+          - Image.gz-dtb
+
+permissions:
+  contents: write   # lets the job publish the flashable zip as a release
+
+env:
+  IMAGE_FORMAT: ${{ inputs.image_format }}
+  ARCH: arm64
+  SUBARCH: arm64
+  LLVM: 1
+  CROSS_COMPILE: aarch64-linux-gnu-
+  # The Magisk-patched boot image you flashed, committed to the repo.
+  # Kernel release, device names and kernel format are read from it.
+  BOOT_IMG: boot/magisk_patched.img
+  # The kernel's build.config.common asks for AOSP clang r416183b (clang 12)
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz
+  FW_URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mt7601u.bin
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git \
+            libelf-dev libncurses-dev libssl-dev lz4 python3 \
+            xz-utils zstd zip unzip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Download Android Clang r416183b
+        run: |
+          mkdir -p "$HOME/clang"
+          curl -fL --retry 5 --retry-delay 5 "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C "$HOME/clang"
+          rm -f clang.tar.gz
+
+          # The archive may or may not have a top-level folder, so find the
+          # clang binary instead of assuming a fixed path.
+          clang_bin_dir="$(dirname "$(find "$HOME/clang" -path '*/bin/clang' | head -n 1)")"
+          if [ ! -x "$clang_bin_dir/clang" ]; then
+            echo "ERROR: clang binary not found in the archive"
+            find "$HOME/clang" -maxdepth 2 | head -n 30
+            exit 1
+          fi
+          echo "$clang_bin_dir" >> "$GITHUB_PATH"
+          "$clang_bin_dir/clang" --version
+
+      - name: Verify Kernel Source
+        run: |
+          test -f Makefile || { echo "ERROR: Kernel source not found!"; exit 1; }
+          test -f arch/arm64/configs/RMX3511_athena_defconfig || {
+            echo "ERROR: RMX3511_athena_defconfig not found!"
+            exit 1
+          }
+          test -f drivers/net/wireless/mediatek/mt7601u/Makefile || {
+            echo "ERROR: MT7601U driver Makefile not found!"
+            exit 1
+          }
+          test -f drivers/net/wireless/mediatek/mt7601u/Kconfig || {
+            echo "ERROR: MT7601U driver Kconfig not found!"
+            exit 1
+          }
+
+      - name: Read release and device info from the boot image
+        run: |
+          test -f "$BOOT_IMG" || {
+            echo "ERROR: $BOOT_IMG not found. Commit your Magisk-patched boot image to that path."
+            exit 1
+          }
+
+          python3 - "$BOOT_IMG" <<'PY' > boot_info.env
+          import re, struct, subprocess, sys
+
+          PAGE = 4096
+          path = sys.argv[1]
+          img = open(path, "rb").read()
+
+          if img[:8] != b"ANDROID!":
+              sys.exit("ERROR: not an Android boot image: " + path)
+
+          kernel_size, ramdisk_size = struct.unpack("<II", img[8:16])
+          header_version = struct.unpack("<I", img[40:44])[0]
+          if header_version < 3:
+              sys.exit("ERROR: boot header v%d is not supported here (need v3 or v4)" % header_version)
+
+          def align(n):
+              return (n + PAGE - 1) // PAGE * PAGE
+
+          kernel = img[PAGE:PAGE + kernel_size]
+          ramdisk_off = PAGE + align(kernel_size)
+          ramdisk = img[ramdisk_off:ramdisk_off + ramdisk_size]
+          print("boot header v%d, kernel %d bytes, ramdisk %d bytes"
+                % (header_version, kernel_size, ramdisk_size), file=sys.stderr)
+
+          # A plain arm64 Image carries "ARM\x64" at offset 0x38
+          plain_image = kernel[0x38:0x3C] == b"ARMd"
+          print("kernel is a plain arm64 Image: %s" % plain_image, file=sys.stderr)
+
+          m = re.search(rb"Linux version (\d+\.\d+\.\d+[^\s\x00]*)", kernel)
+          if not m:
+              sys.exit("ERROR: no 'Linux version' string in the boot image kernel")
+          release = m.group(1).decode()
+
+          decompressors = [
+              (b"\x02\x21\x4c\x18", ["lz4", "-dc"]),   # LZ4 legacy (this image)
+              (b"\x1f\x8b", ["gzip", "-dc"]),
+              (b"\xfd7zXZ\x00", ["xz", "-dc"]),
+              (b"\x28\xb5\x2f\xfd", ["zstd", "-dc"]),
+          ]
+          cpio = ramdisk
+          for magic, cmd in decompressors:
+              if ramdisk.startswith(magic):
+                  cpio = subprocess.run(cmd, input=ramdisk, stdout=subprocess.PIPE, check=True).stdout
+                  break
+          if not cpio.startswith(b"070701"):
+              sys.exit("ERROR: ramdisk did not decompress to a cpio archive")
+
+          def cpio_files(data):
+              files, off = {}, 0
+              while data[off:off + 6] == b"070701":
+                  filesize = int(data[off + 54:off + 62], 16)
+                  namesize = int(data[off + 94:off + 102], 16)
+                  name = data[off + 110:off + 110 + namesize - 1].decode(errors="replace")
+                  off = (off + 110 + namesize + 3) & ~3
+                  if name == "TRAILER!!!":
+                      break
+                  files[name] = data[off:off + filesize]
+                  off = (off + filesize + 3) & ~3
+              return files
+
+          fingerprint = None
+          for body in cpio_files(cpio).values():
+              for line in body.decode(errors="replace").splitlines():
+                  if line.startswith(("ro.bootimage.build.fingerprint=", "ro.build.fingerprint=")):
+                      fingerprint = line.split("=", 1)[1].strip()
+                      break
+              if fingerprint:
+                  break
+          if not fingerprint or fingerprint.count("/") < 2:
+              sys.exit("ERROR: no build fingerprint found in the ramdisk")
+
+          # fingerprint = brand/product/device:release/id/incremental:type/tags
+          brand, product, rest = fingerprint.split("/", 2)
+          device = rest.split(":", 1)[0]
+          for value in (product, device):
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+                  sys.exit("ERROR: cannot parse product/device from: " + fingerprint)
+
+          print("fingerprint: " + fingerprint, file=sys.stderr)
+          print("kernel release: " + release, file=sys.stderr)
+          print("device: %s  product: %s" % (device, product), file=sys.stderr)
+
+          print("WANT_RELEASE=" + release)
+          print("DEVICE_NAME_1=" + device)
+          print("DEVICE_NAME_2=" + product)
+          print("STOCK_IS_PLAIN_IMAGE=" + ("true" if plain_image else "false"))
+          PY
+
+          echo "=========== From the boot image ==========="
+          cat boot_info.env
+          cat boot_info.env >> "$GITHUB_ENV"
+
+          plain="$(grep '^STOCK_IS_PLAIN_IMAGE=' boot_info.env | cut -d= -f2)"
+          if [ "$IMAGE_FORMAT" = "Image" ] && [ "$plain" != "true" ]; then
+            echo "ERROR: the stock kernel is not a plain Image."
+            echo "       Run again with image_format set to Image.gz or Image.gz-dtb."
+            exit 1
+          fi
+
+      - name: Get MT7601U firmware
+        run: |
+          mkdir -p firmware
+          if ! curl -fL --retry 3 --retry-delay 5 -o firmware/mt7601u.bin "$FW_URL"; then
+            echo "kernel.org download failed, using the Ubuntu linux-firmware package"
+            sudo apt-get install -y linux-firmware
+            src="$(ls /lib/firmware/mt7601u.bin* 2>/dev/null | head -n 1 || true)"
+            case "$src" in
+              *.xz)  xz -dc "$src" > firmware/mt7601u.bin ;;
+              *.zst) zstd -dc "$src" > firmware/mt7601u.bin ;;
+              "")    echo "ERROR: mt7601u.bin not found in linux-firmware"; exit 1 ;;
+              *)     cp "$src" firmware/mt7601u.bin ;;
+            esac
+          fi
+          ls -l firmware/mt7601u.bin
+          test -s firmware/mt7601u.bin
+
+      - name: Configure Kernel
+        run: |
+          make O=out RMX3511_athena_defconfig
+
+          # MT7601U built in. cfg80211 and mac80211 are built in too, because
+          # a built-in driver cannot depend on a module. Module signing off.
+          scripts/config --file out/.config \
+            -e WIRELESS \
+            -e WLAN \
+            -e WLAN_VENDOR_MEDIATEK \
+            -e USB \
+            -e CFG80211 \
+            -e MAC80211 \
+            -e MT7601U \
+            -d MODULE_SIG \
+            -d MODULE_SIG_FORCE
+
+          # Embed the adapter firmware. The path must be absolute: with O=out,
+          # relative paths are resolved from the output folder, not the source.
+          scripts/config --file out/.config \
+            -e FW_LOADER \
+            --set-str EXTRA_FIRMWARE "mt7601u.bin" \
+            --set-str EXTRA_FIRMWARE_DIR "$PWD/firmware"
+
+          # Make the release string identical to the phone's running kernel.
+          # WANT_RELEASE was read from the boot image in an earlier step.
+          src_ver="$(make -s kernelversion)"    # e.g. 5.4.256-rev6
+          src_num="$(printf '%s' "$src_ver" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          want_num="$(printf '%s' "$WANT_RELEASE" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
+
+          if [ "$want_num" != "$src_num" ]; then
+            echo "ERROR: the phone runs kernel $want_num but this source tree is $src_num"
+            echo "       phone:  $WANT_RELEASE"
+            echo "       source: $src_ver"
+            echo "       Check out the source tree that matches the boot image."
+            exit 1
+          fi
+
+          suffix="${WANT_RELEASE#"$want_num"}"
+          echo "Phone release: $WANT_RELEASE"
+          echo "Source tree  : $src_ver"
+          echo "Local version: '$suffix'"
+
+          # The Makefile's EXTRAVERSION sits in front of CONFIG_LOCALVERSION.
+          # Clear it so the suffix above is the whole story.
+          sed -i 's/^EXTRAVERSION[[:space:]]*=.*/EXTRAVERSION =/' Makefile
+          if [ "$(make -s kernelversion)" != "$src_num" ]; then
+            echo "ERROR: could not clear EXTRAVERSION in Makefile"
+            grep -n '^EXTRAVERSION' Makefile || true
+            exit 1
+          fi
+
+          # Stop git from adding "+" / "-dirty" / "-g<hash>" to the release
+          : > .scmversion
+
+          scripts/config --file out/.config \
+            --set-str LOCALVERSION "$suffix" \
+            -d LOCALVERSION_AUTO
+
+          make O=out olddefconfig
+
+          echo "=========== Resulting config ==========="
+          grep -E '^CONFIG_(MT7601U|MAC80211|CFG80211|WLAN_VENDOR_MEDIATEK|FW_LOADER|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|LOCALVERSION|MODULE_SIG|MODVERSIONS|LTO|CFI)' out/.config || true
+
+          if ! grep -q '^CONFIG_MT7601U=y' out/.config; then
+            echo "ERROR: MT7601U is not enabled as built-in!"
+            cat drivers/net/wireless/mediatek/mt7601u/Kconfig
+            grep -E 'CONFIG_(WIRELESS|WLAN|WLAN_VENDOR_MEDIATEK|USB|MAC80211|CFG80211)[= ]' out/.config || true
+            grep -n "mediatek" drivers/net/wireless/Kconfig || echo "mediatek/Kconfig NOT sourced in wireless/Kconfig"
+            grep -n "mt7601u" drivers/net/wireless/mediatek/Kconfig || echo "mt7601u/Kconfig NOT sourced in mediatek/Kconfig"
+            grep -n "mediatek" drivers/net/wireless/Makefile || echo "mediatek NOT in wireless/Makefile"
+            exit 1
+          fi
+
+          if ! grep -qx 'CONFIG_EXTRA_FIRMWARE="mt7601u.bin"' out/.config; then
+            echo "ERROR: mt7601u.bin is not set to be built into the kernel"
+            grep -E '^CONFIG_(FW_LOADER|EXTRA_FIRMWARE)' out/.config || true
+            exit 1
+          fi
+
+          if ! grep -qxF "CONFIG_LOCALVERSION=\"$suffix\"" out/.config; then
+            echo "ERROR: CONFIG_LOCALVERSION did not take the phone's suffix"
+            grep -E '^CONFIG_LOCALVERSION' out/.config || true
+            exit 1
+          fi
+
+          if grep -qE '^CONFIG_MODULE_SIG(_FORCE)?=y' out/.config; then
+            echo "ERROR: module signing is still enabled!"
+            exit 1
+          fi
+
+      - name: Build Kernel
+        run: |
+          set -o pipefail
+          : > build.log
+
+          run_make() {
+            make O=out -j"$(nproc)" "$@" 2>&1 | tee -a build.log || {
+              echo "=========== COMPILER ERRORS ==========="
+              grep -nE "error:|fatal error|undefined reference|\*\*\*" build.log | head -n 40
+              exit 1
+            }
+          }
+
+          # Generate the version headers first, so a release mismatch fails
+          # in about a minute instead of after the whole compile.
+          run_make prepare
+
+          release="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $release"
+          if [ "$release" != "$WANT_RELEASE" ]; then
+            echo "ERROR: built release '$release' does not match the phone's '$WANT_RELEASE'"
+            ls -la localversion* out/localversion* .scmversion 2>/dev/null || true
+            exit 1
+          fi
+
+          run_make "$IMAGE_FORMAT"
+
+          # Always build the uncompressed Image too. It is the file the
+          # checks below read, and it is a no-op if already built.
+          run_make Image
+
+          ls -lh out/arch/arm64/boot/
+          strings -a out/arch/arm64/boot/Image > image_strings.txt
+
+          if ! grep -q 'mt7601u.bin' image_strings.txt; then
+            echo "ERROR: mt7601u.bin firmware is not embedded in the kernel image"
+            exit 1
+          fi
+          if ! grep -qF "Linux version $WANT_RELEASE " image_strings.txt; then
+            echo "ERROR: built kernel does not report '$WANT_RELEASE'"
+            grep -F "Linux version" image_strings.txt | head -n 3
+            exit 1
+          fi
+          echo "mt7601u driver strings found: $(grep -c mt7601u image_strings.txt)"
+
+      - name: Package AnyKernel3 Zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE
+
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 - kernel-only flash for RMX3511
+          properties() { '
+          kernel.string=Athena Kernel RMX3511 (MT7601U built-in)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=__DEVICE_NAME_1__
+          device.name2=__DEVICE_NAME_2__
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # replace only the kernel, leave the Magisk ramdisk untouched
+          split_boot;
+          flash_boot;
+          EOF
+
+          # Device names come from the boot image's build fingerprint.
+          # devicecheck stays on, so the zip refuses to flash on any other phone.
+          sed -i -e "s/__DEVICE_NAME_1__/${DEVICE_NAME_1}/" \
+                 -e "s/__DEVICE_NAME_2__/${DEVICE_NAME_2}/" ak3/anykernel.sh
+          grep -E '^(do\.devicecheck|device\.name[12])=' ak3/anykernel.sh
+
+          test -f ak3/META-INF/com/google/android/update-binary || {
+            echo "ERROR: AnyKernel3 installer missing from the clone"
+            exit 1
+          }
+
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" ak3/
+
+          mkdir -p release
+          ZIP="release/Athena-RMX3511-MT7601U-${DEVICE_NAME_1}.zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x ".git*")
+
+          # The zip must be a complete TWRP installer: unzip -t checks integrity,
+          # and the checks below confirm the parts TWRP needs are present.
+          unzip -tq "$ZIP"
+          unzip -Z1 "$ZIP" > zip_contents.txt
+          for required in \
+            'META-INF/com/google/android/update-binary' \
+            'anykernel.sh' \
+            'tools/ak3-core.sh' \
+            "$IMAGE_FORMAT"; do
+            grep -qx "$required" zip_contents.txt || {
+              echo "ERROR: '$required' is missing from the flashable zip"
+              exit 1
+            }
+          done
+          cat zip_contents.txt
+
+          cp "out/arch/arm64/boot/$IMAGE_FORMAT" release/
+          cp out/.config release/kernel-config.txt
+          ls -lh release/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-kernel-RMX3511-mt7601u
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish flashable zip as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Artifact downloads are wrapped in an extra zip, which TWRP cannot
+          # flash. A release asset is the bare zip, so download it directly.
+          tag="athena-kernel-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" release/*.zip \
+            --title "Athena kernel RMX3511 (MT7601U) build ${GITHUB_RUN_NUMBER}" \
+            --notes "Kernel ${WANT_RELEASE}. Flash the zip in TWRP (Install). Only installs on ${DEVICE_NAME_1} / ${DEVICE_NAME_2}, replaces only the kernel and keeps your Magisk ramdisk."
+            
