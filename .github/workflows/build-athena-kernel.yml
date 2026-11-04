@@ -429,5 +429,5 @@ jobs:
           tag="athena-kernel-${GITHUB_RUN_NUMBER}"
           gh release create "$tag" release/*.zip \
             --title "Athena kernel RMX3511 (MT7601U) build ${GITHUB_RUN_NUMBER}" \
-            --notes "Kernel ${WANT_RELEASE}. Flash the zip in TWRP (Install). Only installs on ${DEVICE_NAME_1} / ${DEVICE_NAME_2}, replaces only the kernel and keeps your Magisk ramdisk."
+            --notes "Kernel ${WANT_RELEASE}. Flash the zip in TWRP (Install). Only installs on ${DEVICE_NAME_1} / ${DEVICE_NAME_2}, replaces only the kernel and keeps your Magisk ramdisk." 
             
