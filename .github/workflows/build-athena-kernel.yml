@@ -81,6 +81,16 @@ jobs:
             exit 1
           }
 
+      - name: Fetch the boot image
+        env:
+          BOOT_IMAGE_URL: "https://www.dropbox.com/scl/fi/86gszjckkc9ykem6fjrdj/magisk_patched-31100_DKRQ5.img?rlkey=8a2frvewqiz6wgo21sfvwthjj&st=rdaz1br2&dl=1"
+        run: |
+          mkdir -p "$(dirname "$BOOT_IMG")"
+          if [ -n "$BOOT_IMAGE_URL" ]; then
+            echo "Downloading the boot image from the link you provided"
+            curl -fL --retry 3 --retry-delay 5 -o "$BOOT_IMG" "$BOOT_IMAGE_URL"
+          fi
+
       - name: Read release and device info from the boot image
         run: |
           test -f "$BOOT_IMG" || {
